@@ -232,13 +232,13 @@ func (g *ConsumerGroup) Join(apiVersion int16, memberID string, timestamp time.T
 		delay := g.initialRebalanceTimeoutMs
 		if len(g.members) > 0 {
 			for _, member := range g.members {
-				if member.GenerationID == g.generation {
+				if member.isAlive(g.generation, timestamp) {
 					if member.RebalanceTimeoutMs > 0 {
 						if member.RebalanceTimeoutMs > delay {
 							delay = member.RebalanceTimeoutMs
 						}
 					} else if member.SessionTimeoutMs > 0 && member.SessionTimeoutMs > delay {
-						delay = member.SessionTimeoutMs
+						delay = int32(float64(member.SessionTimeoutMs) * 0.9)
 					}
 				}
 			}
@@ -493,10 +493,7 @@ type ConsumerGroupMember struct {
 	LastHeartbeat      time.Time
 }
 
-func (m *ConsumerGroupMember) isAlive(generationID int32, timestamp time.Time, rebalance bool) bool {
-	if rebalance && m.RebalanceTimeoutMs != -1 {
-		return int32(timestamp.Sub(m.LastHeartbeat).Milliseconds()) < m.RebalanceTimeoutMs
-	}
+func (m *ConsumerGroupMember) isAlive(generationID int32, timestamp time.Time) bool {
 	return generationID == m.GenerationID && int32(timestamp.Sub(m.LastHeartbeat).Milliseconds()) < m.SessionTimeoutMs
 }
 

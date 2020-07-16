@@ -31,26 +31,27 @@ type Broker struct {
 
 	nextConnectionID int64
 	listener         net.Listener
-	connections      map[int64]*connection
 	context          context.Context
+	cancel           context.CancelFunc
+
+	connections map[int64]*connection
+
+	wg sync.WaitGroup
 	sync.RWMutex
 }
 
 type connection struct {
-	ID        int64
-	Addr      string
-	conn      net.Conn
-	buffer    *bufio.Reader
-	context   context.Context
-	cancel    context.CancelFunc
-	operation protocol.APIKeyEnum
-	active    bool
-	opMutex   sync.RWMutex
+	ID      int64
+	Addr    string
+	conn    net.Conn
+	buffer  *bufio.Reader
+	context context.Context
 	sync.Mutex
 }
 
 func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int) error {
 	var err error
+
 	b.listener, err = net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -69,89 +70,23 @@ func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int)
 	}
 	b.Port = int32(v64)
 
-	log.Info().Str("addr", addr).Msg("Server started")
+	b.wg.Add(1)
+	go b.serve()
 
-	// ticker := time.NewTicker(time.Second * 5)
-	// quit := make(chan struct{})
-	// go func() {
-	// 	for {
-	// 		select {
-	// 		case <-ticker.C:
-	// 			b.Lock()
-	// 			connections := []*connection{}
-	// 			for _, connection := range b.connections {
-	// 				connections = append(connections, connection)
-	// 			}
-	// 			sort.Slice(connections, func(i, j int) bool {
-	// 				return connections[i].ID < connections[j].ID
-	// 			})
-	// 			b.Unlock()
-	// 			fmt.Printf("Connection Status\n")
-	// 			fmt.Printf("-----------------\n")
-	// 			for _, connection := range connections {
-	// 				connection.opMutex.RLock()
-	// 				fmt.Printf("STATE %3d %20s %v\n", connection.ID, connection.operation.String(), connection.active)
-	// 				connection.opMutex.RUnlock()
-	// 			}
-	// 		case <-quit:
-	// 			ticker.Stop()
-	// 			return
-	// 		}
-	// 	}
-	// }()
-
-	for {
-		c, active, err := b.acceptConnection(b.context)
-		if err != nil {
-			log.Error().
-				Int("active", active).
-				Err(err).
-				Msg("An error occurred while accepting a new connection")
-			return err
-		}
-		log.Info().Int64("conn_id", c.ID).Str("remote_addr", c.Addr).Int("active", active).Msg("Connection established")
-		go b.handleConnection(c)
-		// go b.proxyConnection("localhost:9098", c)
-	}
-
+	return nil
 }
 
 func (b *Broker) Stop() error {
 	b.Lock()
 	defer b.Unlock()
 
-	for _, connection := range b.connections {
-		b.closeConnection(connection)
-	}
-	err := b.listener.Close()
-	if err != nil {
-		return err
-	}
+	b.cancel()
+	b.listener.Close()
+
+	b.wg.Wait()
+
+	log.Info().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker shutdown")
 	return nil
-}
-
-func (b *Broker) acceptConnection(serverContext context.Context) (*connection, int, error) {
-
-	c, err := b.listener.Accept()
-	if err != nil {
-		return nil, 0, err
-	}
-	b.Lock()
-	defer b.Unlock()
-	active := len(b.connections)
-	b.nextConnectionID++
-	ctx, cancel := context.WithCancel(serverContext)
-	conn := &connection{
-		ID:      b.nextConnectionID,
-		Addr:    c.RemoteAddr().String(),
-		conn:    c,
-		buffer:  bufio.NewReader(c),
-		context: ctx,
-		cancel:  cancel,
-	}
-	b.connections[conn.ID] = conn
-	active++
-	return conn, active, nil
 }
 
 func (b *Broker) Lag(groupIDs []string, offsets map[string]map[int32]int64) int64 {
@@ -221,6 +156,44 @@ LOOP:
 	}
 }
 
+func (b *Broker) serve() {
+	defer b.wg.Done()
+	for {
+		tc, err := b.listener.Accept()
+		if err != nil {
+			select {
+			case <-b.context.Done():
+				log.Error().Err(err).Msg("Could not accept connection as server has been shutdown")
+				return
+			default:
+				log.Error().Err(err).Msg("An error occurred while accepting a new connection")
+			}
+		} else {
+			b.wg.Add(1)
+			b.Lock()
+			active := len(b.connections)
+			b.nextConnectionID++
+			conn := &connection{
+				ID:      b.nextConnectionID,
+				Addr:    tc.RemoteAddr().String(),
+				conn:    tc,
+				buffer:  bufio.NewReader(tc),
+				context: b.context,
+			}
+			b.connections[conn.ID] = conn
+			active++
+			b.Unlock()
+
+			log.Info().Int64("conn_id", conn.ID).Str("remote_addr", conn.Addr).Int("active", active).Msg("Connection established")
+			go func() {
+				b.handleConnection(conn)
+				b.wg.Done()
+			}()
+		}
+	}
+
+}
+
 func (b *Broker) Reset() {
 	b.Lock()
 	for _, consumerGroup := range b.consumerGroups {
@@ -268,7 +241,6 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 				Int64("conn_id", c.ID).
 				Str("remote_addr", c.Addr).
 				Msg("Closing connection")
-			c.cancel()
 			return true
 		} else {
 			log.Error().
@@ -276,7 +248,6 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 				Str("remote_addr", c.Addr).
 				Err(err).
 				Msg("Connection error while reading message")
-			c.cancel()
 			return true
 		}
 	} else {
@@ -291,12 +262,10 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Connection error")
-			c.cancel()
 			return true
 		}
 		log.Debug().
 			Int64("conn_id", c.ID).
-			// Str("remote_addr", c.Addr).
 			Str("client_id", header.ClientID.Value).
 			Str("api", apiKey.String()).
 			Int16("version", apiVersion).
@@ -307,11 +276,9 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 		if err != nil {
 			log.Error().
 				Int64("conn_id", c.ID).
-				// Str("remote_addr", c.Addr).
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Error sending message to server")
-			c.cancel()
 			return true
 		}
 
@@ -319,11 +286,9 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 		if err != nil {
 			log.Error().
 				Int64("conn_id", c.ID).
-				// Str("remote_addr", c.Addr).
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Error receiving response from server")
-			c.cancel()
 			return true
 		}
 
@@ -333,11 +298,9 @@ func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
 		if err != nil {
 			log.Error().
 				Int64("conn_id", c.ID).
-				// Str("remote_addr", c.Addr).
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Error sending response to client")
-			c.cancel()
 			return true
 		}
 	}
@@ -416,7 +379,6 @@ func (b *Broker) handleRequest(c *connection) bool {
 				Int64("conn_id", c.ID).
 				Str("remote_addr", c.Addr).
 				Msg("Closing connection")
-			c.cancel()
 			return true
 		} else {
 			log.Error().
@@ -424,7 +386,6 @@ func (b *Broker) handleRequest(c *connection) bool {
 				Str("remote_addr", c.Addr).
 				Err(err).
 				Msg("Connection error while reading message")
-			c.cancel()
 			return true
 		}
 	} else {
@@ -435,28 +396,19 @@ func (b *Broker) handleRequest(c *connection) bool {
 		if err != nil {
 			log.Error().
 				Int64("conn_id", c.ID).
-				// Str("remote_addr", c.Addr).
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Connection error")
-			c.cancel()
 			return true
 		}
 
-		// if apiKey != protocol.APIKeyFetch {
 		log.Debug().
 			Int64("conn_id", c.ID).
-			// Str("remote_addr", c.Addr).
 			Str("client_id", header.ClientID.Value).
 			Str("api", apiKey.String()).
 			Int16("version", apiVersion).
 			Int32("correlation_id", header.CorrelationID).
 			Msg("REQ RCV")
-		// }
-		c.opMutex.Lock()
-		c.operation = apiKey
-		c.active = true
-		c.opMutex.Unlock()
 
 		resBuffer := bytes.NewBuffer([]byte{})
 		switch apiKey {
@@ -498,7 +450,6 @@ func (b *Broker) handleRequest(c *connection) bool {
 				Str("client_id", header.ClientID.Value).
 				Err(err).
 				Msg("Error encountered while processing message")
-			c.cancel()
 			return true
 		}
 		bytesWritten, err := c.conn.Write(resBuffer.Bytes())
@@ -511,10 +462,8 @@ func (b *Broker) handleRequest(c *connection) bool {
 				Int32("correlation_id", header.CorrelationID).
 				Err(err).
 				Msg("Connection write error")
-			c.cancel()
 			return true
 		}
-		// if apiKey != protocol.APIKeyFetch {
 		log.Debug().
 			Int64("conn_id", c.ID).
 			Str("client_id", header.ClientID.Value).
@@ -523,10 +472,6 @@ func (b *Broker) handleRequest(c *connection) bool {
 			Int("bytes_written", bytesWritten).
 			Int32("correlation_id", header.CorrelationID).
 			Msg("RES SND")
-		// }
-		c.opMutex.Lock()
-		c.active = false
-		c.opMutex.Unlock()
 	}
 	return false
 }
@@ -1109,7 +1054,6 @@ func (b *Broker) handleJoinGroupRequest(apiVersion int16, header protocol.Reques
 					var exception KafkaException
 					if errors.As(err, &exception) {
 						res.ErrorCode = exception.Code
-						util.Debug("JOIN GROUP RES INI", res)
 						err = res.Write(apiVersion, header, writer)
 						if err != nil {
 							return err
@@ -1267,11 +1211,12 @@ func (b *Broker) handleMetadataRequest(apiVersion int16, header protocol.Request
 
 func NewBroker(c *Cluster) *Broker {
 	nextBrokerID++
-	return &Broker{
+	b := &Broker{
 		ID:             nextBrokerID,
 		Cluster:        c,
 		consumerGroups: map[string]*ConsumerGroup{},
-		context:        context.Background(),
 		connections:    map[int64]*connection{},
 	}
+	b.context, b.cancel = context.WithCancel(context.Background())
+	return b
 }
