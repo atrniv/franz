@@ -48,7 +48,7 @@ func (g *ConsumerGroup) Reset() {
 	g.Lock()
 	switch g.state {
 	case ConsumerGroupStateJoining:
-		if g.joinTimer.Stop() {
+		if g.joinTimer != nil && g.joinTimer.Stop() {
 			g.generation++
 			g.stateMutex.Unlock()
 		}
@@ -254,8 +254,8 @@ func (g *ConsumerGroup) Join(apiVersion int16, memberID string, timestamp time.T
 			} else {
 				g.joinTimer = time.AfterFunc(time.Millisecond*time.Duration(delay), func() {
 					g.Lock()
+					defer g.Unlock()
 					g.leaderElect()
-					g.Unlock()
 				})
 			}
 		} else {
@@ -266,8 +266,8 @@ func (g *ConsumerGroup) Join(apiVersion int16, memberID string, timestamp time.T
 				Msg("Waiting for group members to join")
 			g.joinTimer = time.AfterFunc(time.Millisecond*time.Duration(delay), func() {
 				g.Lock()
+				defer g.Unlock()
 				g.leaderElect()
-				g.Unlock()
 			})
 		}
 

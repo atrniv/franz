@@ -2,6 +2,8 @@ package domain
 
 import (
 	"sync"
+
+	uuid "github.com/satori/go.uuid"
 )
 
 type Cluster struct {
@@ -120,7 +122,6 @@ func (c *Cluster) Lag(groupIDs []string, topicNames []string) int64 {
 	for _, broker := range c.brokers {
 		lag += broker.Lag(groupIDs, offsets)
 	}
-	// println("BROKER LAG", lag)
 	return lag
 }
 
@@ -170,8 +171,6 @@ func (c *Cluster) Reset() {
 }
 
 func (c *Cluster) Stop() error {
-	c.Lock()
-	defer c.Unlock()
 	for _, broker := range c.brokers {
 		err := broker.Stop()
 		if err != nil {
@@ -183,7 +182,7 @@ func (c *Cluster) Stop() error {
 
 func NewCluster(id string) *Cluster {
 	return &Cluster{
-		ID:      id,
+		ID:      id + uuid.NewV1().String(),
 		brokers: []*Broker{},
 		topics:  []*Topic{},
 	}

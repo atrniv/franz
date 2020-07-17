@@ -29,15 +29,15 @@ type Broker struct {
 	Port           int32
 	consumerGroups map[string]*ConsumerGroup
 
+	sync.RWMutex
+
 	nextConnectionID int64
-	listener         net.Listener
 	context          context.Context
 	cancel           context.CancelFunc
-
-	connections map[int64]*connection
-
-	wg sync.WaitGroup
-	sync.RWMutex
+	listener         net.Listener
+	connections      map[int64]*connection
+	sl               *sync.RWMutex
+	wg               *sync.WaitGroup
 }
 
 type connection struct {
@@ -46,7 +46,40 @@ type connection struct {
 	conn    net.Conn
 	buffer  *bufio.Reader
 	context context.Context
-	sync.Mutex
+	closed  bool
+	active  bool
+	sync.RWMutex
+}
+
+func (c *connection) markActive(active bool) {
+	c.Lock()
+	c.active = active
+	c.Unlock()
+}
+
+func (c *connection) close() {
+	for {
+		c.Lock()
+		if !c.active && !c.closed {
+			c.closed = true
+			err := c.conn.Close()
+			if err != nil {
+				log.Error().
+					Int64("conn_id", c.ID).
+					Err(err).
+					Msg("Connection close error")
+			}
+			c.Unlock()
+			break
+		} else if c.closed {
+			c.Unlock()
+			break
+		} else {
+			log.Error().Int64("conn_id", c.ID).Msg("Connection busy")
+		}
+		c.Unlock()
+		time.Sleep(time.Millisecond * 100)
+	}
 }
 
 func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int) error {
@@ -70,22 +103,32 @@ func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int)
 	}
 	b.Port = int32(v64)
 
-	b.wg.Add(1)
 	go b.serve()
+
+	log.Debug().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker has started accepting connections")
 
 	return nil
 }
 
 func (b *Broker) Stop() error {
-	b.Lock()
-	defer b.Unlock()
-
+	b.sl.Lock()
 	b.cancel()
 	b.listener.Close()
 
+	connections := []*connection{}
+	for _, connection := range b.connections {
+		connections = append(connections, connection)
+	}
+	b.sl.Unlock()
+
+	b.Reset()
+	for _, connection := range connections {
+		b.closeConnection(connection)
+	}
+
 	b.wg.Wait()
 
-	log.Info().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker shutdown")
+	log.Debug().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker shutdown")
 	return nil
 }
 
@@ -117,24 +160,17 @@ func (b *Broker) Lag(groupIDs []string, offsets map[string]map[int32]int64) int6
 }
 
 func (b *Broker) closeConnection(c *connection) {
-	b.Lock()
-	defer b.Unlock()
-	err := c.conn.Close()
-	if err != nil {
-		log.Error().
-			Int64("conn_id", c.ID).
-			Str("remote_addr", c.Addr).
-			Err(err).
-			Msg("Connection close error")
-	}
-	delete(b.connections, c.ID)
+	c.close()
 
+	b.sl.Lock()
+	delete(b.connections, c.ID)
 	active := len(b.connections)
+	b.sl.Unlock()
+
 	log.Info().
 		Int64("conn_id", c.ID).
 		Str("remote_addr", c.Addr).
 		Int("active", active).
-		Err(err).
 		Msg("Connection closed")
 }
 
@@ -157,20 +193,20 @@ LOOP:
 }
 
 func (b *Broker) serve() {
+	b.wg.Add(1)
 	defer b.wg.Done()
 	for {
 		tc, err := b.listener.Accept()
 		if err != nil {
 			select {
 			case <-b.context.Done():
-				log.Error().Err(err).Msg("Could not accept connection as server has been shutdown")
+				log.Debug().Msg("Broker has stopped accepting new connections")
 				return
 			default:
 				log.Error().Err(err).Msg("An error occurred while accepting a new connection")
 			}
 		} else {
-			b.wg.Add(1)
-			b.Lock()
+			b.sl.Lock()
 			active := len(b.connections)
 			b.nextConnectionID++
 			conn := &connection{
@@ -182,12 +218,13 @@ func (b *Broker) serve() {
 			}
 			b.connections[conn.ID] = conn
 			active++
-			b.Unlock()
+			b.sl.Unlock()
 
 			log.Info().Int64("conn_id", conn.ID).Str("remote_addr", conn.Addr).Int("active", active).Msg("Connection established")
 			go func() {
+				b.wg.Add(1)
+				defer b.wg.Done()
 				b.handleConnection(conn)
-				b.wg.Done()
 			}()
 		}
 	}
@@ -232,8 +269,6 @@ LOOP:
 }
 
 func (b *Broker) proxyRequest(serverConn *net.TCPConn, c *connection) bool {
-	c.Lock()
-	defer c.Unlock()
 	serverReq, err := protocol.NewTCPMessage(c.conn)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -370,8 +405,6 @@ func (b *Broker) debugRequestResponse(serverReq protocol.TCPMessage, serverRes p
 }
 
 func (b *Broker) handleRequest(c *connection) bool {
-	c.Lock()
-	defer c.Unlock()
 	message, err := protocol.NewTCPMessage(c.buffer)
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -389,6 +422,9 @@ func (b *Broker) handleRequest(c *connection) bool {
 			return true
 		}
 	} else {
+		c.markActive(true)
+		defer c.markActive(false)
+
 		reader := protocol.NewReader(message)
 
 		apiKey, apiVersion := reader.APIMeta()
@@ -452,6 +488,7 @@ func (b *Broker) handleRequest(c *connection) bool {
 				Msg("Error encountered while processing message")
 			return true
 		}
+
 		bytesWritten, err := c.conn.Write(resBuffer.Bytes())
 		if err != nil {
 			log.Error().
@@ -686,7 +723,6 @@ func (b *Broker) handleFetchRequest(apiVersion int16, header protocol.RequestHea
 		} else {
 			err = res.Write(apiVersion, header, writer)
 			if err != nil {
-				println("FETCH WRITE EXIT", err.Error())
 				return err
 			}
 			break
@@ -1019,7 +1055,7 @@ func (b *Broker) handleJoinGroupRequest(apiVersion int16, header protocol.Reques
 			return err
 		}
 
-		if consumerGroup.assignmentProtocol == "" {
+		if consumerGroup.AssignmentProtocol() == "" {
 			res.ErrorCode = ErrInconsistentGroupProtocol.Code
 			err = res.Write(apiVersion, header, writer)
 			if err != nil {
@@ -1216,6 +1252,8 @@ func NewBroker(c *Cluster) *Broker {
 		Cluster:        c,
 		consumerGroups: map[string]*ConsumerGroup{},
 		connections:    map[int64]*connection{},
+		sl:             &sync.RWMutex{},
+		wg:             &sync.WaitGroup{},
 	}
 	b.context, b.cancel = context.WithCancel(context.Background())
 	return b
