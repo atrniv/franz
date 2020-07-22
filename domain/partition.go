@@ -76,7 +76,7 @@ func (p *Partition) AppendMessages(apiVersion int16, records protocol.RecordData
 	p.Lock()
 	defer p.Unlock()
 	timestamp := time.Now().UnixNano() / 1e6
-	lastOffset := int64(-1)
+	lastOffset := p.LastOffset
 	if len(p.Messages) > 0 {
 		lastOffset = p.Messages[len(p.Messages)-1].Offset
 	}
