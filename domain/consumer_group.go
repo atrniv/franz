@@ -82,6 +82,12 @@ func (g *ConsumerGroup) Reset() {
 	g.Unlock()
 }
 
+func (g *ConsumerGroup) IsReady() bool {
+	g.RLock()
+	defer g.RUnlock()
+	return g.currentMembers >= g.expectedMembers
+}
+
 func (g *ConsumerGroup) Generation() int32 {
 	g.RLock()
 	defer g.RUnlock()

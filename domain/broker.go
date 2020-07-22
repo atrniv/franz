@@ -107,7 +107,36 @@ func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int)
 
 	log.Debug().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker has started accepting connections")
 
+	if expectedConsumerGroupMembers != nil {
+		log.Info().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Waiting for consumers to join group")
+		if !b.waitForConsumerGroups() {
+			err := fmt.Errorf("Kafka consumer failed to join group")
+			log.Error().Err(err).Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Kafka setup failed")
+			return err
+		}
+		log.Info().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("All consumers ready")
+	}
+
 	return nil
+}
+
+func (b *Broker) waitForConsumerGroups() bool {
+	retries := 20
+	for {
+		ready := true
+		b.RLock()
+		for _, consumerGroup := range b.consumerGroups {
+			if !consumerGroup.IsReady() {
+				ready = false
+			}
+		}
+		b.RUnlock()
+		retries--
+		if ready || retries < 0 {
+			return ready
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func (b *Broker) Stop() error {
