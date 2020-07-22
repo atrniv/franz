@@ -16,7 +16,7 @@ func init() {
 
 func main() {
 	cluster := domain.NewCluster("kafka")
-	err := cluster.StartBroker(":9092", nil)
+	err := cluster.StartBroker(":9092", nil, false)
 	if err != nil {
 		panic(err)
 	}

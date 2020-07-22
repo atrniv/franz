@@ -13,10 +13,10 @@ type Cluster struct {
 	sync.RWMutex
 }
 
-func (c *Cluster) StartBroker(addr string, expectedMembers map[string]int) error {
+func (c *Cluster) StartBroker(addr string, expectedMembers map[string]int, waitForConsumers bool) error {
 	broker := NewBroker(c)
 	c.brokers = append(c.brokers, broker)
-	return broker.Start(addr, expectedMembers)
+	return broker.Start(addr, expectedMembers, waitForConsumers)
 }
 
 func (c *Cluster) GetBrokers() []*Broker {

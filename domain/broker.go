@@ -82,7 +82,7 @@ func (c *connection) close() {
 	}
 }
 
-func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int) error {
+func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int, waitForConsumers bool) error {
 	var err error
 
 	b.listener, err = net.Listen("tcp", addr)
@@ -107,7 +107,7 @@ func (b *Broker) Start(addr string, expectedConsumerGroupMembers map[string]int)
 
 	log.Debug().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Broker has started accepting connections")
 
-	if expectedConsumerGroupMembers != nil {
+	if expectedConsumerGroupMembers != nil && waitForConsumers {
 		log.Info().Str("cluster_id", b.Cluster.ID).Int32("broker_id", b.ID).Msg("Waiting for consumers to join group")
 		if !b.waitForConsumerGroups() {
 			err := fmt.Errorf("Kafka consumer failed to join group")
